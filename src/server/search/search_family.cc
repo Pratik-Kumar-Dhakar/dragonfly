@@ -1364,6 +1364,24 @@ float GlobalMaxTextScore(absl::Span<const SearchResult> results) {
   return max_it == results.end() ? 0.0f : max_it->max_text_score;
 }
 
+// RESP3 replies of FT.SEARCH and FT.AGGREGATE are maps: the results come first, the total after.
+void StartResp3Reply(size_t results, RedisReplyBuilder* rb) {
+  rb->StartCollection(5, CollectionType::MAP);
+  rb->SendSimpleString("attributes");
+  rb->SendEmptyArray();
+  rb->SendSimpleString("format");
+  rb->SendSimpleString("STRING");
+  rb->SendSimpleString("results");
+  rb->StartArray(results);
+}
+
+void EndResp3Reply(size_t total, RedisReplyBuilder* rb) {
+  rb->SendSimpleString("total_results");
+  rb->SendLong(total);
+  rb->SendSimpleString("warning");
+  rb->SendEmptyArray();
+}
+
 void SearchReply(const SearchParams& params,
                  std::optional<search::KnnScoreSortOption> knn_sort_option,
                  std::string_view inject_score_alias, absl::Span<SearchResult> results,
@@ -1435,11 +1453,24 @@ void SearchReply(const SearchParams& params,
   auto* rb = static_cast<RedisReplyBuilder*>(builder);
   const size_t items_per_field = (reply_with_ids_only ? 1 : 2) + params.with_sortkeys +
                                  params.with_scores + params.with_payloads;
+
+  // RESP3 makes each result a map and names its parts.
+  const bool resp3 = rb->IsResp3();
+  auto send_key = [rb, resp3](string_view key) {
+    if (resp3)
+      rb->SendSimpleString(key);
+  };
+
   // Batch the reply so temporary sortkeys are copied into the batching buffer instead of referenced
   // past their lifetime — a >kMaxInlineSize bulk string enqueued by reference under a reply scope
   // is copied only when the scope ends, after the "$" + s temporary is gone (use-after-free).
   SinkReplyBuilder::ReplyAggregator agg{rb};
-  rb->StartArray(limit * items_per_field + 1);
+  if (resp3) {
+    StartResp3Reply(limit, rb);
+  } else {
+    rb->StartArray(limit * items_per_field + 1);
+    rb->SendLong(total_hits);
+  }
 
   Overloaded sortable_value_sender{
       [rb](monostate) { rb->SendNull(); },
@@ -1447,15 +1478,24 @@ void SearchReply(const SearchParams& params,
       [rb](const string& s) { rb->SendBulkString(absl::StrCat("$", s)); },
   };
 
-  rb->SendLong(total_hits);
   for (size_t i = offset; i < end; i++) {
+    if (resp3)
+      rb->StartCollection(items_per_field + 1, CollectionType::MAP);
+    send_key("id");
     rb->SendBulkString(docs[i]->key);
     if (params.with_scores) {
-      rb->SendBulkString(absl::StrCat(docs[i]->text_score));
+      send_key("score");
+      if (resp3)
+        rb->SendDouble(docs[i]->text_score);
+      else
+        rb->SendBulkString(absl::StrCat(docs[i]->text_score));
     }
-    if (params.with_payloads)  // Documents have no payloads.
+    if (params.with_payloads) {  // Documents have no payloads.
+      send_key("payload");
       rb->SendNull();
+    }
     if (params.with_sortkeys) {
+      send_key("sortkey");
       visit(sortable_value_sender, docs[i]->sort_score);
     }
 
@@ -1463,9 +1503,17 @@ void SearchReply(const SearchParams& params,
       if (knn_score_ret_field)
         docs[i]->values[*knn_score_ret_field] = docs[i]->knn_score;
 
+      send_key("extra_attributes");
       SendSerializedDoc(*docs[i], builder);
     }
+    if (resp3) {
+      rb->SendSimpleString("values");
+      rb->SendEmptyArray();
+    }
   }
+
+  if (resp3)
+    EndResp3Reply(total_hits, rb);
 }
 
 // Warms up the query parser to avoid first-call slowness
@@ -2184,7 +2232,7 @@ void HybridReply(const HybridSearchParams& params, search::VectorSimilarity vsim
     const bool emit_vsim = yield_vsim_score && doc.has_knn;
     const size_t n_pairs = (emit_text ? 1 : 0) + (emit_vsim ? 1 : 0) +
                            (emit_fields ? doc.values.size() + (yield_combined_score ? 1 : 0) : 2);
-    rb->StartArray(n_pairs * 2);
+    rb->StartCollection(n_pairs, CollectionType::MAP);
 
     if (emit_text) {
       rb->SendBulkString(params.yield_text_score_as);
@@ -2216,7 +2264,7 @@ void HybridReply(const HybridSearchParams& params, search::VectorSimilarity vsim
   rb->StartArray(0);
 
   rb->SendBulkString("execution_time");
-  rb->SendBulkString(absl::StrFormat("%.6f", absl::ToDoubleMilliseconds(total_took)));
+  rb->SendDouble(absl::ToDoubleMilliseconds(total_took));
 }
 
 // Concludes the hop left open when a query handler returns. Skipped in an atomic MULTI/EXEC or
@@ -3113,8 +3161,8 @@ void CmdFtInfo(CmdArgParser parser, CommandContext* cmd_cntx) {
   const auto& schema = info.base_index.schema;
 
   bool has_custom_stopwords = info.base_index.options.custom_stopwords;
-  // Reply with a flat array under RESP3 too, not a map.
-  rb->StartArray((has_custom_stopwords ? 8 : 7) * 2);
+  SinkReplyBuilder::ReplyAggregator agg{rb};
+  rb->StartCollection(has_custom_stopwords ? 8 : 7, CollectionType::MAP);
 
   rb->SendSimpleString("index_name");
   rb->SendBulkString(info.base_index.name);
@@ -3123,7 +3171,7 @@ void CmdFtInfo(CmdArgParser parser, CommandContext* cmd_cntx) {
   {
     const bool has_lang = schema.default_language != "english";
     const bool has_lang_field = !schema.language_field.empty();
-    rb->StartArray((3 + has_lang + has_lang_field) * 2);
+    rb->StartCollection(3 + has_lang + has_lang_field, CollectionType::MAP);
     rb->SendSimpleString("key_type");
     rb->SendSimpleString(info.base_index.type == DocIndex::JSON ? "JSON" : "HASH");
     rb->SendSimpleString("prefixes");
@@ -3158,51 +3206,38 @@ void CmdFtInfo(CmdArgParser parser, CommandContext* cmd_cntx) {
   rb->StartArray(schema.fields.size());
   for (const auto& [alias, field_ptr] : schema.Ordered()) {
     const auto& field_info = *field_ptr;
-    vector<string> info;
-    char buf[128];
-
-    string_view base[] = {"identifier"sv, field_info.identifier,
-                          "attribute"sv,  alias,
-                          "type"sv,       SearchFieldTypeToString(field_info.type)};
-    info.insert(info.end(), base, base + ABSL_ARRAYSIZE(base));
+    vector<pair<string_view, variant<string_view, int64_t, double>>> params = {
+        {"identifier", field_info.identifier},
+        {"attribute", alias},
+        {"type", SearchFieldTypeToString(field_info.type)}};
+    vector<string_view> flags;
 
     if (field_info.type == search::SchemaField::VECTOR) {
       auto& vparams = std::get<search::SchemaField::VectorParams>(field_info.special_params);
-      info.emplace_back("algorithm");
-      info.emplace_back(vparams.use_hnsw ? "HNSW" : "FLAT");
-      info.emplace_back("data_type");
-      info.emplace_back(search::VectorDataTypeToString(vparams.data_type));
-      info.emplace_back("dim");
-      info.emplace_back(std::to_string(vparams.dim));
-      info.emplace_back("distance_metric");
-      info.emplace_back(search::VectorSimilarityToString(vparams.sim));
-      info.emplace_back("initial_cap");
-      info.emplace_back(std::to_string(vparams.capacity));
+      params.emplace_back("algorithm", vparams.use_hnsw ? "HNSW"sv : "FLAT"sv);
+      params.emplace_back("data_type", search::VectorDataTypeToString(vparams.data_type));
+      params.emplace_back("dim", static_cast<int64_t>(vparams.dim));
+      params.emplace_back("distance_metric", search::VectorSimilarityToString(vparams.sim));
+      params.emplace_back("initial_cap", static_cast<int64_t>(vparams.capacity));
       if (vparams.use_hnsw) {
-        info.emplace_back("M");
-        info.emplace_back(std::to_string(vparams.hnsw_m));
-        info.emplace_back("ef_construction");
-        info.emplace_back(std::to_string(vparams.hnsw_ef_construction));
-        info.emplace_back("ef_runtime");
-        info.emplace_back(std::to_string(vparams.hnsw_ef_runtime));
-        info.emplace_back("epsilon");
-        info.emplace_back(RedisReplyBuilder::FormatDouble(vparams.hnsw_epsilon, buf, sizeof(buf)));
+        params.emplace_back("M", static_cast<int64_t>(vparams.hnsw_m));
+        params.emplace_back("ef_construction", static_cast<int64_t>(vparams.hnsw_ef_construction));
+        params.emplace_back("ef_runtime", static_cast<int64_t>(vparams.hnsw_ef_runtime));
+        params.emplace_back("epsilon", vparams.hnsw_epsilon);
       }
     } else if (field_info.type == search::SchemaField::TAG) {
       auto& tparams = std::get<search::SchemaField::TagParams>(field_info.special_params);
-      info.emplace_back("SEPARATOR");
-      info.emplace_back(tparams.separator ? std::string(1, *tparams.separator) : "");
+      params.emplace_back("SEPARATOR",
+                          tparams.separator ? string_view{&*tparams.separator, 1} : ""sv);
       if (tparams.case_sensitive)
-        info.emplace_back("CASESENSITIVE");
+        flags.emplace_back("CASESENSITIVE");
     } else if (field_info.type == search::SchemaField::TEXT) {
       auto& tparams = std::get<search::SchemaField::TextParams>(field_info.special_params);
-      info.emplace_back("WEIGHT");
-      info.emplace_back(RedisReplyBuilder::FormatDouble(tparams.weight, buf, sizeof(buf)));
+      params.emplace_back("WEIGHT", tparams.weight);
     } else if (field_info.type == search::SchemaField::NUMERIC) {
       auto& numeric_params =
           std::get<search::SchemaField::NumericParams>(field_info.special_params);
-      info.emplace_back("blocksize"sv);
-      info.emplace_back(std::to_string(numeric_params.block_size));
+      params.emplace_back("blocksize", static_cast<int64_t>(numeric_params.block_size));
     }
 
     // Flags in the reference order, with UNF where the reference shows it.
@@ -3211,25 +3246,42 @@ void CmdFtInfo(CmdArgParser parser, CommandContext* cmd_cntx) {
     const auto* tag_params =
         std::get_if<search::SchemaField::TagParams>(&field_info.special_params);
     if (field_info.flags & search::SchemaField::SORTABLE) {
-      info.emplace_back("SORTABLE"sv);
+      flags.emplace_back("SORTABLE"sv);
       if ((field_info.flags & search::SchemaField::UNF) ||
           field_info.type == search::SchemaField::NUMERIC ||
           (tag_params && tag_params->case_sensitive) || on_json)
-        info.emplace_back("UNF"sv);
+        flags.emplace_back("UNF"sv);
     }
     if (text_params && text_params->no_stem)
-      info.emplace_back("NOSTEM"sv);
+      flags.emplace_back("NOSTEM"sv);
     if (field_info.flags & search::SchemaField::NOINDEX)
-      info.emplace_back("NOINDEX"sv);
+      flags.emplace_back("NOINDEX"sv);
     if ((text_params && text_params->with_suffixtrie) ||
         (tag_params && tag_params->with_suffixtrie))
-      info.emplace_back("WITHSUFFIXTRIE"sv);
+      flags.emplace_back("WITHSUFFIXTRIE"sv);
     if (field_info.flags & search::SchemaField::INDEXEMPTY)
-      info.emplace_back("INDEXEMPTY"sv);
+      flags.emplace_back("INDEXEMPTY"sv);
     if (field_info.flags & search::SchemaField::INDEXMISSING)
-      info.emplace_back("INDEXMISSING"sv);
+      flags.emplace_back("INDEXMISSING"sv);
 
-    rb->SendBulkStrArr(info);
+    // RESP3 makes the attribute a map and lists its flags under one key.
+    Overloaded send_value{[rb](string_view s) { rb->SendBulkString(s); },
+                          [rb](int64_t i) { rb->SendLong(i); },
+                          [rb](double d) { rb->SendDouble(d); }};
+    if (rb->IsResp3())
+      rb->StartCollection(params.size() + 1, CollectionType::MAP);
+    else
+      rb->StartArray(params.size() * 2 + flags.size());
+    for (const auto& [key, value] : params) {
+      rb->SendBulkString(key);
+      visit(send_value, value);
+    }
+    if (rb->IsResp3()) {
+      rb->SendBulkString("flags");
+      rb->StartArray(flags.size());
+    }
+    for (string_view flag : flags)
+      rb->SendBulkString(flag);
   }
 
   rb->SendSimpleString("num_docs");
@@ -3262,7 +3314,7 @@ void CmdFtList(CmdArgParser /*parser*/, CommandContext* cmd_cntx) {
     return OpStatus::OK;
   });
   auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx->rb());
-  rb->SendBulkStrArr(names);
+  rb->SendBulkStrArr(names, CollectionType::SET);
 }
 
 static vector<SearchResult> FtSearchCSS(std::string_view idx, std::string_view query,
@@ -3613,11 +3665,20 @@ void SendFtProfileSearchResponse(const SearchParams& params,
 
   // First element -> Result of the search command
   // Second element -> Profile information
+  // RESP3 sends them as a map under Results and Profile.
   SinkReplyBuilder::ReplyAggregator agg{rb};
-  rb->StartArray(2);
+  const bool resp3 = rb->IsResp3();
+  if (resp3) {
+    rb->StartCollection(2, CollectionType::MAP);
+    rb->SendSimpleString("Results");
+  } else {
+    rb->StartArray(2);
+  }
   SearchReply(params, knn_sort_option, inject_score_alias, search_results, rb, false);
 
   // Profile information
+  if (resp3)
+    rb->SendSimpleString("Profile");
   rb->StartArray(profile_results.size() + 1);
 
   // General stats
@@ -4495,8 +4556,14 @@ void CmdFtAggregate(CmdArgParser parser, CommandContext* cmd_cntx) {
   auto sortable_value_sender = SortableValueSender(rb);
 
   const size_t result_size = agg_results.values.size();
-  RedisReplyBuilder::ArrayScope scope{rb, result_size + 1};
-  rb->SendLong(result_size);
+  const bool resp3 = rb->IsResp3();
+  SinkReplyBuilder::ReplyScope scope{rb};
+  if (resp3) {
+    StartResp3Reply(result_size, rb);
+  } else {
+    rb->StartArray(result_size + 1);
+    rb->SendLong(result_size);
+  }
 
   for (const auto& value : agg_results.values) {
     size_t fields_count = 0;
@@ -4506,7 +4573,11 @@ void CmdFtAggregate(CmdArgParser parser, CommandContext* cmd_cntx) {
       }
     }
 
-    rb->StartArray(fields_count * 2);
+    if (resp3) {
+      rb->StartCollection(2, CollectionType::MAP);
+      rb->SendSimpleString("extra_attributes");
+    }
+    rb->StartCollection(fields_count, CollectionType::MAP);
     for (const auto& field : agg_results.fields_to_print) {
       auto it = value.find(field);
       if (it != value.end()) {
@@ -4514,7 +4585,14 @@ void CmdFtAggregate(CmdArgParser parser, CommandContext* cmd_cntx) {
         std::visit(sortable_value_sender, it->second);
       }
     }
+    if (resp3) {
+      rb->SendSimpleString("values");
+      rb->SendEmptyArray();
+    }
   }
+
+  if (resp3)
+    EndResp3Reply(result_size, rb);
 }
 
 void CmdFtSynDump(CmdArgParser parser, CommandContext* cmd_cntx) {
@@ -4569,9 +4647,8 @@ void CmdFtSynDump(CmdArgParser parser, CommandContext* cmd_cntx) {
     }
   }
 
-  // Format response according to Redis protocol:
-  // Array of term + array of group ids pairs
-  rb->StartArray(merged_term_groups.size() * 2);
+  // Each term with the array of its group ids.
+  rb->StartCollection(merged_term_groups.size(), CollectionType::MAP);
   for (const auto& [term, group_ids] : merged_term_groups) {
     rb->SendBulkString(term);
     rb->StartArray(group_ids.size());
@@ -4601,10 +4678,18 @@ void FtConfigHelp(CmdArgParser* parser, CommandContext* cmd_cntx) {
   }
 
   auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx->rb());
-  rb->StartArray(res.size());
+
+  // RESP3 maps each name to its description and value.
+  const bool resp3 = rb->IsResp3();
+  rb->StartCollection(res.size(), resp3 ? CollectionType::MAP : CollectionType::ARRAY);
   for (const auto& flag : res) {
-    rb->StartArray(5);
-    rb->SendBulkString(flag->Name());
+    if (resp3) {
+      rb->SendBulkString(flag->Name());
+      rb->StartCollection(2, CollectionType::MAP);
+    } else {
+      rb->StartArray(5);
+      rb->SendBulkString(flag->Name());
+    }
     rb->SendBulkString("Description"sv);
     rb->SendBulkString(flag->Help());
     rb->SendBulkString("Value"sv);
@@ -4630,7 +4715,16 @@ void FtConfigGet(CmdArgParser* parser, CommandContext* cmd_cntx) {
     }
   }
   auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx->rb());
-  return rb->SendBulkStrArr(res, CollectionType::MAP);
+  if (rb->IsResp3())
+    return rb->SendBulkStrArr(res, CollectionType::MAP);
+
+  // RESP2 nests each name-value pair.
+  RedisReplyBuilder::ArrayScope scope{rb, res.size() / 2};
+  for (size_t i = 0; i < res.size(); i += 2) {
+    rb->StartArray(2);
+    rb->SendBulkString(res[i]);
+    rb->SendBulkString(res[i + 1]);
+  }
 }
 
 void FtConfigSet(CmdArgParser* parser, CommandContext* cmd_cntx) {

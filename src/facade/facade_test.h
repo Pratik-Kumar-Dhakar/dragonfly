@@ -87,6 +87,30 @@ template <typename... Args> auto RespElementsAre(const Args&... matchers) {
   return RespArray(::testing::ElementsAre(matchers...));
 }
 
+// RESP3 arrays, maps and sets all arrive as ARRAY; these check which one was sent.
+inline const char* Resp3Kind(const RespExpr& e) {
+  if (e.type != RespExpr::ARRAY)
+    return "not an array";
+  if (e.agg == RespExpr::Agg::kMap)
+    return "a map";
+  return e.agg == RespExpr::Agg::kSet ? "a set" : "an array";
+}
+
+MATCHER(IsResp3ArrayKind, "is a RESP3 array") {
+  *result_listener << "which is " << Resp3Kind(arg);
+  return arg.type == RespExpr::ARRAY && arg.agg == RespExpr::Agg::kArray;
+}
+
+MATCHER(IsResp3MapKind, "is a RESP3 map") {
+  *result_listener << "which is " << Resp3Kind(arg);
+  return arg.type == RespExpr::ARRAY && arg.agg == RespExpr::Agg::kMap;
+}
+
+MATCHER(IsResp3SetKind, "is a RESP3 set") {
+  *result_listener << "which is " << Resp3Kind(arg);
+  return arg.type == RespExpr::ARRAY && arg.agg == RespExpr::Agg::kSet;
+}
+
 inline bool operator==(const RespExpr& left, std::string_view s) {
   return left.type == RespExpr::STRING && ToSV(left.GetBuf()) == s;
 }
